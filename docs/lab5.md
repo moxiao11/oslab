@@ -59,49 +59,34 @@ let current = current_task().unwrap();
 ```rust
 
 pub struct TaskControlBlock {
-    // Immutable
-    /// Process identifier
-    pub pid: PidHandle,
-    /// Mutable
     inner: UPSafeCell<TaskControlBlockInner>,
 }
 
 impl TaskControlBlock {
-    /// Get the mutable reference of the inner TCB
+    //进入内部信息
     pub fn inner_exclusive_access(&self) -> RefMut<'_, TaskControlBlockInner> {
         self.inner.exclusive_access()
-    }
-    /// Get the address of app's page table
-    pub fn get_user_token(&self) -> usize {
-        let inner = self.inner_exclusive_access();
-        inner.memory_set.token()
     }
 }
 
 
 
 pub struct TaskControlBlockInner {
-    /// A vector containing TCBs of all child processes of the current process
+    //子进程
     pub children: Vec<Arc<TaskControlBlock>>,
-
+    // 退出码
     pub exit_code: i32,
-    /// Priority of the process
-    pub priority: usize,
-
-    /// stride of the process
-    pub stride: Stride,
 }
 
 impl TaskControlBlockInner {
-    /// get the user token
-    pub fn get_user_token(&self) -> usize {
-        self.memory_set.token()
-    }
+    //判断是否是僵尸进程
     pub fn is_zombie(&self) -> bool {
         self.get_status() == TaskStatus::Zombie
 }
 
 ```
+
+
 
 我们会发现进入inner调用inner_exclusive_access()即可，可以访问TCB内部的一些信息，TCB内部呢，就会有一个children的数组，存着自己的子进程。那接下来一顿操作，从头到尾遍历会吧，当pid == -1(任意进程都能等待也就是任意进程都是子进程)或者pid相同的时候(子进程也是一个tcb有getpid操作)
 
@@ -121,3 +106,90 @@ let mut flag = false;
 
 ### 寻找僵尸进程
 
+看到这里，依旧遍历大法，从头到尾遍历，然后用那个is_zombie()函数
+
+```rust
+let mut idx = 0;
+let mut found = false;
+for (i, child) in inner.children.iter().enumerate() {
+    if (pid == -1 || child.getpid() == pid as usize)
+        && child.inner_exclusive_access().is_zombie()
+    {
+        idx = i;
+        found = true;
+        break;
+    }
+}
+```
+如果找到了呢？就返回僵尸进程的pid,也就是我记录的那个idx的位置的进程,然后退出码要返回。
+```rust
+if found {
+    let tmp = inner.children.remove(idx);
+    let code = tmp.inner_exclusive_access().exit_code;
+    *translated_refmut(token, exit_code_ptr) = code;
+    return tmp.getpid() as isize;
+}
+```
+
+这里唯一要解释的就是
+
+`*translated_refmut(token, exit_code_ptr) = code;`
+
+其实就是根据父进程的token找到页表，然后就能看到退出码的物理地址进行修改。
+
+ai给的解释: 
+```text
+根据当前进程的页表 token，把一个“用户态虚拟地址” exit_code_ptr 翻译成内核可以访问的可变引用。
+```
+叽里咕噜说啥呢,直接看函数定义，接收一个token和一个可变指针，然后PageTable通过token返回来一个页表,剩下的好像就看不懂了
+
+```rust
+pub fn translated_refmut<T>(token: usize, ptr: *mut T) -> &'static mut T {
+    let page_table = PageTable::from_token(token);
+    let va = ptr as usize;
+    page_table
+        .translate_va(VirtAddr::from(va))
+        .unwrap()
+        .get_mut()
+}
+```
+
+其实是这样一个流程，比如父进程先这样
+```rust
+int exit_code = -1;//初始随机一个退出码
+int pid = fork();
+
+if (pid == 0) {
+    exit(7);
+} else {
+    int ret = waitpid(pid, &exit_code);
+}
+```
+
+父进程调用sys_fork会建立父子关系，能存下子进程的各种信息
+
+当子进程退出的时候
+```rust
+inner.task_status = TaskStatus::Zombie;
+inner.exit_code = 7;
+```
+
+父进程，比如-1的地址是0x80401000
+```rust
+int ret = waitpid(101, &exit_code);
+sys_waitpid(101, 0x80401000 as *mut i32)
+```
+
+父进程从子进程中取出退出码
+```rust
+let code = tmp.inner_exclusive_access().exit_code;
+```
+然后需要修改这个exit_code，但是吧不能直接
+```rust
+*exit_code_ptr = code; // 错误
+```
+这里需要根据token得到物理地址，然后再写,也就是
+```rust
+let token = current_user_token();
+*translated_refmut(token, exit_code_ptr) = code;
+```
